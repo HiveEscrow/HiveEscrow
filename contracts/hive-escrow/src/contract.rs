@@ -1,7 +1,7 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    crypto::bn254::{Bn254G1Affine, Bn254G2Affine},
-    token, Address, Bytes, BytesN, Env,
+    crypto::bn254::{Bn254Fr, Bn254G1Affine, Bn254G2Affine},
+    token, Address, Bytes, BytesN, Env, Vec,
 };
 
 use crate::storage::{
@@ -9,27 +9,31 @@ use crate::storage::{
     TaskStatus, DEADLINE_WINDOW,
 };
 
-/// Groth16 proof over BN254: the three elliptic curve points.
+/// Groth16 proof over BN254.
 #[contracttype]
 #[derive(Clone)]
 pub struct Proof {
-    pub a: Bn254G1Affine, // π_A  (G1)
-    pub b: Bn254G2Affine, // π_B  (G2)
-    pub c: Bn254G1Affine, // π_C  (G1)
+    pub a: Bn254G1Affine, // π_A (G1)
+    pub b: Bn254G2Affine, // π_B (G2)
+    pub c: Bn254G1Affine, // π_C (G1)
 }
 
-/// Groth16 verification key components needed for the pairing check.
-/// Caller supplies this alongside the proof; the contract verifies
-/// sha256(vk_bytes) == stored vk_hash before using it.
+/// Groth16 verification key.
+/// `ic` must have length == number_of_public_inputs + 1.
+/// IC[0] is the base point; IC[1..] are per-input points.
 #[contracttype]
 #[derive(Clone)]
 pub struct VerifyingKey {
-    pub alpha: Bn254G1Affine, // α   (G1)
-    pub beta: Bn254G2Affine,  // β   (G2)
-    pub gamma: Bn254G2Affine, // γ   (G2)
-    pub delta: Bn254G2Affine, // δ   (G2)
-    pub ic: Bn254G1Affine,    // IC[0] (G1) — combined with public inputs off-chain
+    pub alpha: Bn254G1Affine,    // α   (G1)
+    pub beta: Bn254G2Affine,     // β   (G2)
+    pub gamma: Bn254G2Affine,    // γ   (G2)
+    pub delta: Bn254G2Affine,    // δ   (G2)
+    pub ic: Vec<Bn254G1Affine>,  // IC[0..n] (G1)
 }
+
+/// Public inputs as 32-byte big-endian BN254 scalar field elements.
+/// Length must equal vk.ic.len() - 1.
+pub type PublicInputs = Vec<BytesN<32>>;
 
 #[soroban_sdk::contracterror]
 #[derive(Debug)]
@@ -43,6 +47,7 @@ pub enum Error {
     VkMismatch = 7,
     DeadlineNotReached = 8,
     TaskNotFound = 9,
+    InvalidPublicInputs = 10,
 }
 
 #[contract]
@@ -103,11 +108,10 @@ impl HiveEscrow {
 
     /// Worker submits a Groth16 ZK-proof to claim the reward.
     ///
-    /// The contract assembles the pairing check internally from the typed
-    /// `Proof` and `VerifyingKey` structs, eliminating caller assembly errors.
-    ///
-    /// Pairing equation verified:
-    ///   e(A, B) · e(α, β) · e(C, δ) · e(ic_combined, γ) == 1
+    /// Verification steps:
+    ///   1. sha256(vk_bytes) == task.vk_hash
+    ///   2. ic_combined = IC[0] + Σ(public_inputs[i] * IC[i+1])  via g1_msm
+    ///   3. pairing_check: e(A,B) · e(α,β) · e(C,δ) · e(ic_combined,γ) == 1
     pub fn claim_reward(
         env: Env,
         worker: Address,
@@ -115,6 +119,7 @@ impl HiveEscrow {
         vk_bytes: Bytes,
         vk: VerifyingKey,
         proof: Proof,
+        public_inputs: PublicInputs,
     ) -> Result<(), Error> {
         worker.require_auth();
         bump_instance(&env);
@@ -131,19 +136,43 @@ impl HiveEscrow {
             return Err(Error::DeadlineExpired);
         }
 
-        // Verify the supplied VK matches the committed hash
+        // 1. Verify VK commitment
         let computed: BytesN<32> = env.crypto().sha256(&vk_bytes).to_bytes();
         if computed != task.vk_hash {
             return Err(Error::VkMismatch);
         }
 
-        // Groth16 pairing check via BN254 host function (Protocol 25)
-        // e(A,B) · e(α,β) · e(C,δ) · e(ic,γ) == 1
-        // Assembled as two parallel vectors of equal length.
-        let g1 = soroban_sdk::vec![&env, proof.a, vk.alpha, proof.c, vk.ic];
+        // 2. Validate IC / public input lengths: ic.len() == public_inputs.len() + 1
+        let n_inputs = public_inputs.len();
+        if vk.ic.len() != n_inputs + 1 {
+            return Err(Error::InvalidPublicInputs);
+        }
+
+        // 3. Fold public inputs: ic_combined = IC[0] + Σ(input[i] * IC[i+1])
+        //    Use g1_msm for the sum, then add IC[0].
+        let bn254 = env.crypto().bn254();
+
+        let ic_combined = if n_inputs == 0 {
+            vk.ic.get(0).unwrap()
+        } else {
+            // Build parallel vecs: IC[1..] and scalars from public_inputs
+            let mut ic_points: Vec<Bn254G1Affine> = Vec::new(&env);
+            let mut scalars: Vec<Bn254Fr> = Vec::new(&env);
+            for i in 0..n_inputs {
+                ic_points.push_back(vk.ic.get(i + 1).unwrap());
+                scalars.push_back(Bn254Fr::from_bytes(public_inputs.get(i).unwrap()));
+            }
+            // IC[0] + MSM(IC[1..], inputs)
+            bn254.g1_add(&vk.ic.get(0).unwrap(), &bn254.g1_msm(ic_points, scalars))
+        };
+
+        // 4. Groth16 pairing check: e(A,B) · e(α,β) · e(C,δ) · e(ic_combined,γ) == 1
+        //    Negate A to match the standard equation form used by most toolchains:
+        //    e(-A,B) · e(α,β) · e(C,δ) · e(ic_combined,γ) == 1
+        let g1 = soroban_sdk::vec![&env, -proof.a, vk.alpha, proof.c, ic_combined];
         let g2 = soroban_sdk::vec![&env, proof.b, vk.beta, vk.delta, vk.gamma];
 
-        if !env.crypto().bn254().pairing_check(g1, g2) {
+        if !bn254.pairing_check(g1, g2) {
             return Err(Error::InvalidProof);
         }
 
