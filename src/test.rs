@@ -3,10 +3,10 @@
 use soroban_sdk::{
     crypto::bn254::{Bn254G1Affine, Bn254G2Affine},
     testutils::{Address as _, Ledger},
-    token, Address, Bytes, BytesN, Env, Vec,
+    token, Address, Bytes, BytesN, Env,
 };
 
-use crate::contract::{Error, HiveEscrow, HiveEscrowClient};
+use crate::contract::{Error, HiveEscrow, HiveEscrowClient, Proof, VerifyingKey};
 use crate::storage::DEADLINE_WINDOW;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -34,52 +34,59 @@ fn dummy_vk(env: &Env) -> (Bytes, BytesN<32>) {
     (vk, hash)
 }
 
-/// Minimal valid BN254 G1 point (generator): x=1, y=2 (64 bytes, big-endian)
-fn g1_generator(env: &Env) -> Bn254G1Affine {
+fn g1(env: &Env, x_last: u8, y_last: u8) -> Bn254G1Affine {
     let mut buf = [0u8; 64];
-    buf[31] = 1; // x = 1
-    buf[63] = 2; // y = 2
+    buf[31] = x_last;
+    buf[63] = y_last;
     unsafe { Bn254G1Affine::from_bytes(BytesN::from_array(env, &buf)) }
 }
 
-/// Minimal valid BN254 G2 point (generator): 128 bytes
 fn g2_generator(env: &Env) -> Bn254G2Affine {
-    // BN254 G2 generator coordinates (big-endian, 128 bytes)
-    let x_c1: [u8; 32] = hex_to_bytes(
-        "1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed",
-    );
-    let x_c0: [u8; 32] = hex_to_bytes(
-        "198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2",
-    );
-    let y_c1: [u8; 32] = hex_to_bytes(
-        "12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa",
-    );
-    let y_c0: [u8; 32] = hex_to_bytes(
-        "090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b",
-    );
     let mut buf = [0u8; 128];
-    buf[0..32].copy_from_slice(&x_c1);
-    buf[32..64].copy_from_slice(&x_c0);
-    buf[64..96].copy_from_slice(&y_c1);
-    buf[96..128].copy_from_slice(&y_c0);
+    // BN254 G2 generator (big-endian x_c1, x_c0, y_c1, y_c0)
+    let coords: [[u8; 32]; 4] = [
+        hex32("1800deef121f1e76426a00665e5c4479674322d4f75edadd46debd5cd992f6ed"),
+        hex32("198e9393920d483a7260bfb731fb5d25f1aa493335a9e71297e485b7aef312c2"),
+        hex32("12c85ea5db8c6deb4aab71808dcb408fe3d1e7690c43d37b4ce6cc0166fa7daa"),
+        hex32("090689d0585ff075ec9e99ad690c3395bc4b313370b38ef355acdadcd122975b"),
+    ];
+    for (i, c) in coords.iter().enumerate() {
+        buf[i * 32..(i + 1) * 32].copy_from_slice(c);
+    }
     unsafe { Bn254G2Affine::from_bytes(BytesN::from_array(env, &buf)) }
 }
 
-fn hex_to_bytes(hex: &str) -> [u8; 32] {
+fn hex32(s: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0]);
-        let lo = hex_nibble(chunk[1]);
-        out[i] = (hi << 4) | lo;
+    for (i, c) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = (nibble(c[0]) << 4) | nibble(c[1]);
     }
     out
 }
 
-fn hex_nibble(b: u8) -> u8 {
+fn nibble(b: u8) -> u8 {
     match b {
         b'0'..=b'9' => b - b'0',
         b'a'..=b'f' => b - b'a' + 10,
         _ => 0,
+    }
+}
+
+fn dummy_proof(env: &Env) -> Proof {
+    Proof {
+        a: g1(env, 1, 2),
+        b: g2_generator(env),
+        c: g1(env, 3, 4),
+    }
+}
+
+fn dummy_vk_struct(env: &Env) -> VerifyingKey {
+    VerifyingKey {
+        alpha: g1(env, 5, 6),
+        beta: g2_generator(env),
+        gamma: g2_generator(env),
+        delta: g2_generator(env),
+        ic: g1(env, 7, 8),
     }
 }
 
@@ -99,6 +106,7 @@ fn test_create_task_success() {
         .unwrap();
 
     assert_eq!(task_id, 0);
+    assert!(client.get_task(&task_id).is_some());
 }
 
 #[test]
@@ -120,11 +128,26 @@ fn test_create_task_deadline_too_soon() {
     let (_, vk_hash) = dummy_vk(&env);
 
     let err = client
-        .try_create_task(&employer, &worker, &token, &100, &vk_hash, &(env.ledger().timestamp() + 1))
+        .try_create_task(
+            &employer,
+            &worker,
+            &token,
+            &100,
+            &vk_hash,
+            &(env.ledger().timestamp() + 1),
+        )
         .unwrap_err()
         .unwrap();
 
     assert_eq!(err, Error::DeadlineTooSoon);
+}
+
+// ── get_task ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_get_task_not_found() {
+    let (env, client, _, _, _) = setup();
+    assert!(client.get_task(&99).is_none());
 }
 
 // ── refund ────────────────────────────────────────────────────────────────────
@@ -203,12 +226,15 @@ fn test_claim_vk_mismatch_fails() {
         .create_task(&employer, &worker, &token, &500_000, &vk_hash, &deadline)
         .unwrap();
 
-    let wrong_vk = Bytes::from_array(&env, &[0xFFu8; 32]);
-    let g1 = Vec::from_array(&env, [g1_generator(&env)]);
-    let g2 = Vec::from_array(&env, [g2_generator(&env)]);
-
+    let wrong_vk_bytes = Bytes::from_array(&env, &[0xFFu8; 32]);
     let err = client
-        .try_claim_reward(&worker, &task_id, &wrong_vk, &g1, &g2)
+        .try_claim_reward(
+            &worker,
+            &task_id,
+            &wrong_vk_bytes,
+            &dummy_vk_struct(&env),
+            &dummy_proof(&env),
+        )
         .unwrap_err()
         .unwrap();
 
@@ -218,7 +244,7 @@ fn test_claim_vk_mismatch_fails() {
 #[test]
 fn test_claim_after_deadline_fails() {
     let (env, client, employer, worker, token) = setup();
-    let (vk, vk_hash) = dummy_vk(&env);
+    let (vk_bytes, vk_hash) = dummy_vk(&env);
     let deadline = valid_deadline(&env);
 
     let task_id = client
@@ -227,11 +253,14 @@ fn test_claim_after_deadline_fails() {
 
     env.ledger().set_timestamp(deadline + 1);
 
-    let g1 = Vec::from_array(&env, [g1_generator(&env)]);
-    let g2 = Vec::from_array(&env, [g2_generator(&env)]);
-
     let err = client
-        .try_claim_reward(&worker, &task_id, &vk, &g1, &g2)
+        .try_claim_reward(
+            &worker,
+            &task_id,
+            &vk_bytes,
+            &dummy_vk_struct(&env),
+            &dummy_proof(&env),
+        )
         .unwrap_err()
         .unwrap();
 
@@ -241,7 +270,7 @@ fn test_claim_after_deadline_fails() {
 #[test]
 fn test_claim_wrong_worker_fails() {
     let (env, client, employer, worker, token) = setup();
-    let (vk, vk_hash) = dummy_vk(&env);
+    let (vk_bytes, vk_hash) = dummy_vk(&env);
     let deadline = valid_deadline(&env);
 
     let task_id = client
@@ -249,13 +278,35 @@ fn test_claim_wrong_worker_fails() {
         .unwrap();
 
     let impostor = Address::generate(&env);
-    let g1 = Vec::from_array(&env, [g1_generator(&env)]);
-    let g2 = Vec::from_array(&env, [g2_generator(&env)]);
-
     let err = client
-        .try_claim_reward(&impostor, &task_id, &vk, &g1, &g2)
+        .try_claim_reward(
+            &impostor,
+            &task_id,
+            &vk_bytes,
+            &dummy_vk_struct(&env),
+            &dummy_proof(&env),
+        )
         .unwrap_err()
         .unwrap();
 
     assert_eq!(err, Error::Unauthorized);
+}
+
+#[test]
+fn test_claim_task_not_found() {
+    let (env, client, _, worker, _) = setup();
+    let (vk_bytes, _) = dummy_vk(&env);
+
+    let err = client
+        .try_claim_reward(
+            &worker,
+            &999,
+            &vk_bytes,
+            &dummy_vk_struct(&env),
+            &dummy_proof(&env),
+        )
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(err, Error::TaskNotFound);
 }

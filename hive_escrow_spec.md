@@ -45,7 +45,7 @@ DataKey::Task(task_id: u64)   → EscrowTask   [Temporary]
 DataKey::TaskCounter          → u64           [Instance]
 ```
 
-Temporary entries are extended on `create_task` with a TTL of `TASK_TTL_LEDGERS` (≈ 7 days at 5s/ledger = 120,960 ledgers). The TTL is bumped on `claim_reward` and `refund` to ensure liveness during the transaction.
+Temporary entries are extended on `create_task` with a TTL of `TASK_TTL_LEDGERS` (≈ 30 days at 5s/ledger = 518,400 ledgers). This is intentionally larger than the maximum deadline window to ensure a task is never archived before the employer can call `refund`. The TTL is bumped on `claim_reward` and `refund` to ensure liveness during the transaction. The contract instance TTL is bumped on every mutating call via `bump_instance`.
 
 ---
 
@@ -53,8 +53,8 @@ Temporary entries are extended on `create_task` with a TTL of `TASK_TTL_LEDGERS`
 
 | Constant            | Value       | Rationale                              |
 |---------------------|-------------|----------------------------------------|
-| `DEADLINE_WINDOW`   | `172800` s  | 48-hour refund window                  |
-| `TASK_TTL_LEDGERS`  | `120960`    | ~7 days at 5 s/ledger                  |
+| `DEADLINE_WINDOW`   | `172800` s  | 48-hour minimum refund window          |
+| `TASK_TTL_LEDGERS`  | `518400`    | ~30 days at 5 s/ledger (> max deadline)|
 | `BUMP_TTL_LEDGERS`  | `17280`     | ~1 day bump threshold                  |
 
 ---
@@ -162,5 +162,5 @@ The contract stores only `vk_hash = sha256(vk_bytes)`. The Worker supplies the f
 
 - Partial payments / milestone-based escrow
 - Multi-worker tasks
-- On-chain VK storage (VK is supplied per-call and verified via hash)
+- On-chain VK registry — a separate contract mapping `vk_hash → vk_bytes` so workers register a VK once rather than supplying it on every `claim_reward` call
 - Dispute resolution

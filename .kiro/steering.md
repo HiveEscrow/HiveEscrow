@@ -30,7 +30,7 @@ src/
 - Document TTL constants in `storage.rs` with their human-readable equivalent (e.g., `// ~7 days @ 5s/ledger`).
 
 ### ZK / Cryptography
-- Use `env.crypto().bls12_381().pairing_check(payload)` for BN254 proof verification (Protocol 25 host function).
+- Use `env.crypto().bn254().pairing_check(vp1: Vec<Bn254G1Affine>, vp2: Vec<Bn254G2Affine>)` for BN254 proof verification (Protocol 25 host function).
 - Never trust off-chain proof validity. Always verify on-chain.
 - Store only `vk_hash = sha256(vk_bytes)` in contract state. Require callers to supply full `vk_bytes` and verify the hash before calling `pairing_check`.
 
