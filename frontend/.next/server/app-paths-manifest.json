@@ -1,6 +1,0 @@
-{
-  "/_not-found/page": "app/_not-found/page.js",
-  "/create/page": "app/create/page.js",
-  "/page": "app/page.js",
-  "/task/[id]/page": "app/task/[id]/page.js"
-}
