@@ -1,0 +1,4 @@
+target/
+*.wasm
+*.wasm.optimized
+.soroban/
